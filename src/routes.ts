@@ -38,7 +38,9 @@ function isOriginAllowed(origin?: string): boolean {
 
 export async function registerRoutes(app: FastifyInstance) {
   await app.register((app: FastifyInstance) =>
-    app.get("/", async () => "Use /api")
+    app.get("/", async () => {
+      return { message: "Use /api", version: getVersionInfo() };
+    })
   );
   await app.register((app: FastifyInstance) =>
     app.get("/api", async () => {
