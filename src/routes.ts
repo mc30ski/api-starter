@@ -1,6 +1,8 @@
 import { FastifyInstance } from "fastify";
 
 export async function registerRoutes(app: FastifyInstance) {
+  app.get("/", async () => ({ message: "API" }));
+
   app.get("/path", async () => ({ message: "Hello from /path" }));
 
   app.get("/path/another", async () => ({
