@@ -1,16 +1,15 @@
 import { FastifyInstance } from "fastify";
+import adminRoutes from "./routes/admin";
 
 export async function registerRoutes(app: FastifyInstance) {
-  app.get("/", async () => ({ message: "API" }));
+  await app.register((app: FastifyInstance) =>
+    app.get("/", async () => "Use /api")
+  );
 
-  app.get("/path", async () => ({ message: "Hello from /path" }));
-
-  app.get("/path/another", async () => ({
-    message: "Hello from /path/another",
-  }));
-
-  app.get("/path/:id/another", async (req, reply) => {
-    const { id } = req.params as { id: string };
-    return { message: `Hello from /path/${id}/another` };
-  });
+  await app.register(
+    async (api) => {
+      await api.register(adminRoutes);
+    },
+    { prefix: "/api" }
+  );
 }
