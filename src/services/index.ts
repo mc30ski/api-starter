@@ -5,7 +5,13 @@ import { Prisma, PrismaClient, EquipmentStatus } from "@prisma/client";
 export const services: Services = {
   equipment: {
     async listAvailable() {
-      return [];
+      return prisma.equipment.findMany({
+        where: {
+          status: EquipmentStatus.AVAILABLE,
+          checkouts: { none: { releasedAt: null } },
+        },
+        orderBy: { createdAt: "desc" },
+      });
     },
   },
 };

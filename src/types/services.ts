@@ -1,7 +1,4 @@
-export type Equipment = {
-  name: string;
-  description: string;
-};
+import type { Equipment } from "@prisma/client";
 
 export type Services = {
   equipment: {
