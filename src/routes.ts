@@ -3,6 +3,7 @@ import cors, { type FastifyCorsOptions } from "@fastify/cors";
 import sensible from "@fastify/sensible";
 import { getVersionInfo } from "./lib/version";
 import auth from "./plugins/auth";
+import errorMapper from "./plugins/errorMapper";
 import adminRoutes from "./routes/admin";
 
 // ---------- CORS Helpers
@@ -121,6 +122,7 @@ export async function registerRoutes(app: FastifyInstance) {
 
   await app.register(sensible);
   await app.register(auth);
+  await app.register(errorMapper);
 
   // ---------- Always attach ACAO on responses (including 401/403) for allowed origins.
   app.addHook("onSend", (req, reply, payload, done) => {
