@@ -1,6 +1,7 @@
 import { FastifyInstance } from "fastify";
 import cors, { type FastifyCorsOptions } from "@fastify/cors";
 import sensible from "@fastify/sensible";
+import { getVersionInfo } from "./lib/version";
 import adminRoutes from "./routes/admin";
 
 // ---------- CORS Helpers
@@ -40,7 +41,9 @@ export async function registerRoutes(app: FastifyInstance) {
     app.get("/", async () => "Use /api")
   );
   await app.register((app: FastifyInstance) =>
-    app.get("/api", async () => "Hello from the API.")
+    app.get("/api", async () => {
+      return { message: "API endpoint.", version: getVersionInfo() };
+    })
   );
 
   // ---------- Register all routes
