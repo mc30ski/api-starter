@@ -15,7 +15,9 @@
     "@prisma/client": "^6.16.2",
     "dotenv": "^17.2.2",
     "fastify": "4.28.1",
-    "ws": "^8.18.3"
+    "ws": "^8.18.3",
+    "@clerk/clerk-sdk-node": "^5.1.6",
+    "@clerk/types": "4.26.0"
   },
   "devDependencies": {
     "@types/ws": "^8.18.1",
