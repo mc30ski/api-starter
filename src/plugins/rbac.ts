@@ -1,7 +1,7 @@
 import fp from "fastify-plugin";
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import { Role } from "../types/services";
 import { services } from "../services";
+import { Role } from "../types/services";
 import "@fastify/sensible";
 
 // RBAC helper plugin for Fastify.
