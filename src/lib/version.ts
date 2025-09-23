@@ -29,25 +29,11 @@ function detectCommit(): string | null {
   );
 }
 
-function detectBuildTime(): string | null {
-  // Prefer explicit env if you set it in CI, otherwise fall back to dist mtime or null
-  if (process.env.BUILD_TIME) return process.env.BUILD_TIME;
-  try {
-    // Try the compiled entry as a proxy for build time
-    const distStart = path.resolve(__dirname, "../server.js");
-    const s = fs.statSync(distStart);
-    return s.mtime.toISOString();
-  } catch {
-    return null;
-  }
-}
-
 const versionInfo = {
   name: process.env.APP_NAME || "@repo/api",
   env: process.env.NODE_ENV || "development",
   version: readPackageVersion(),
   commit: detectCommit(),
-  buildTime: detectBuildTime(), // ISO string or null
   startedAt: new Date().toISOString(), // updates each deploy/restart
   node: process.version,
 };
