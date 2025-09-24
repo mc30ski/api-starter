@@ -38,6 +38,8 @@ export default fp(async (app: FastifyInstance) => {
   app.decorate(
     "requireRole",
     async (req: FastifyRequest, reply: any, role: Role) => {
+      console.log("MIKEW, HERE1");
+
       await app.requireApproved(req, reply);
 
       const roles = (req as any).user?.roles as Role[] | undefined;
