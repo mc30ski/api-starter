@@ -26,7 +26,6 @@ export default fp(async (app: FastifyInstance) => {
 
     // Attach for downstream usage
     (req as any).user = me;
-
     if (!me.isApproved) {
       throw app.httpErrors.forbidden("NOT_APPROVED");
     }
@@ -38,8 +37,6 @@ export default fp(async (app: FastifyInstance) => {
   app.decorate(
     "requireRole",
     async (req: FastifyRequest, reply: any, role: Role) => {
-      console.log("MIKEW, HERE1");
-
       await app.requireApproved(req, reply);
 
       const roles = (req as any).user?.roles as Role[] | undefined;
