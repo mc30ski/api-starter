@@ -1,9 +1,14 @@
 import { prisma } from "../db/prisma";
-import type { Services } from "../types/services";
+import type { Services, EquipmentWithHolder } from "../types/services";
 import { Role } from "../types/services";
-import { Prisma, PrismaClient, EquipmentStatus } from "@prisma/client";
+import {
+  Prisma,
+  PrismaClient,
+  AuditAction,
+  Role as RoleVal,
+  EquipmentStatus,
+} from "@prisma/client";
 import { verifyToken, createClerkClient } from "@clerk/backend";
-import { Role as RoleVal } from "@prisma/client";
 import { ServiceError } from "../lib/errors";
 
 if (!process.env.CLERK_SECRET_KEY) {
@@ -11,13 +16,107 @@ if (!process.env.CLERK_SECRET_KEY) {
 }
 const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
 
+type Tx = Prisma.TransactionClient;
+type Db = PrismaClient | Prisma.TransactionClient;
+
 // ---- helpers ---------------------------------------------------------------
+
+const now = () => new Date();
 
 function parseBootstrapList() {
   return (process.env.ADMIN_BOOTSTRAP_EMAILS ?? "")
     .split(/[,\s]+/)
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
+}
+
+// Row-level lock helper
+async function lockEquipment(tx: Tx, id: string) {
+  await tx.$queryRawUnsafe(
+    `SELECT id FROM "Equipment" WHERE id = $1 FOR UPDATE`,
+    id
+  );
+}
+
+// Return the single active reservation/checkout row (releasedAt is NULL)
+async function getActiveCheckout(tx: Tx, equipmentId: string) {
+  return tx.checkout.findFirst({
+    where: { equipmentId, releasedAt: null },
+  });
+}
+
+// True if any active reservation/checkout exists
+async function hasActiveCheckout(tx: Tx, equipmentId: string) {
+  const c = await tx.checkout.count({
+    where: { equipmentId, releasedAt: null },
+  });
+  return c > 0;
+}
+
+// Recompute derived status...
+async function recomputeStatus(tx: Tx, equipmentId: string) {
+  const eq = await tx.equipment.findUnique({ where: { id: equipmentId } });
+  if (!eq) throw new ServiceError("NOT_FOUND", "Equipment not found", 404);
+
+  if (eq.status === EquipmentStatus.RETIRED || eq.retiredAt) return eq;
+  if (eq.status === EquipmentStatus.MAINTENANCE) return eq;
+
+  const active = await getActiveCheckout(tx, equipmentId);
+  if (active) {
+    const target = active.checkedOutAt
+      ? EquipmentStatus.CHECKED_OUT
+      : EquipmentStatus.RESERVED;
+    if (eq.status !== target) {
+      return tx.equipment.update({
+        where: { id: equipmentId },
+        data: { status: target },
+      });
+    }
+    return eq;
+  }
+
+  if (eq.status !== EquipmentStatus.AVAILABLE) {
+    return tx.equipment.update({
+      where: { id: equipmentId },
+      data: { status: EquipmentStatus.AVAILABLE },
+    });
+  }
+  return eq;
+}
+
+// Write audit with FK-safe fallback
+async function writeAudit(
+  db: Db,
+  action: AuditAction,
+  actorUserId?: string,
+  equipmentId?: string,
+  metadata?: unknown
+) {
+  try {
+    await db.auditEvent.create({
+      data: { action, actorUserId, equipmentId, metadata: metadata as any },
+    });
+  } catch (e) {
+    if (
+      e instanceof Prisma.PrismaClientKnownRequestError &&
+      e.code === "P2003"
+    ) {
+      await db.auditEvent.create({
+        data: {
+          action,
+          actorUserId,
+          equipmentId: null,
+          metadata: {
+            ...(metadata as any),
+            deletedEquipmentId: equipmentId,
+            note: "FK missing → set null",
+          },
+        },
+      });
+      return;
+    }
+    throw e;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -33,9 +132,465 @@ export const services: Services = {
         orderBy: { createdAt: "desc" },
       });
     },
+
+    //TODO: NOT USED ANYWHERE?
+    async listAll() {
+      return prisma.equipment.findMany({ orderBy: { createdAt: "desc" } });
+    },
+
+    async listAllAdmin() {
+      const rows = await prisma.equipment.findMany({
+        orderBy: { createdAt: "desc" },
+        include: {
+          checkouts: {
+            where: { releasedAt: null },
+            include: { user: true },
+            take: 1,
+          },
+        },
+      });
+
+      const mapped: EquipmentWithHolder[] = rows.map((e) => {
+        const active = e.checkouts[0];
+        const holder = active
+          ? {
+              userId: active.userId,
+              displayName: active.user?.displayName ?? null,
+              email: active.user?.email ?? null,
+              reservedAt: active.reservedAt,
+              checkedOutAt: active.checkedOutAt ?? null,
+              state: active.checkedOutAt
+                ? EquipmentStatus.CHECKED_OUT
+                : EquipmentStatus.RESERVED,
+            }
+          : null;
+
+        const { checkouts, auditEvents, ...equip } = e as any;
+        return { ...(equip as any), holder };
+      });
+
+      return mapped;
+    },
+
+    async listForWorkers() {
+      return prisma.equipment.findMany({
+        where: { status: { in: [EquipmentStatus.AVAILABLE] } },
+        orderBy: { createdAt: "desc" },
+      });
+    },
+
+    async listMine(userId: string) {
+      return prisma.equipment
+        .findMany({
+          where: { status: { not: EquipmentStatus.RETIRED } },
+          orderBy: { createdAt: "desc" },
+          include: {
+            checkouts: { where: { userId, releasedAt: null }, take: 1 },
+          },
+        })
+        .then((rows) =>
+          rows
+            .filter((r) => r.checkouts.length > 0)
+            .map((r) => {
+              const { checkouts, ...rest } = r as any;
+              return rest as typeof r;
+            })
+        );
+    },
+
+    // Items workers cannot reserve RESERVED/CHECKED_OUT/MAINTENANCE/RETIRED
+    async listUnavailableForWorkers() {
+      return prisma.equipment.findMany({
+        where: {
+          status: {
+            in: [
+              EquipmentStatus.RESERVED,
+              EquipmentStatus.CHECKED_OUT,
+              EquipmentStatus.MAINTENANCE,
+              EquipmentStatus.RETIRED,
+            ],
+          },
+        },
+        orderBy: { createdAt: "desc" },
+      });
+    },
+
+    async create(input) {
+      return prisma.$transaction(async (tx) => {
+        const data: Prisma.EquipmentCreateInput = {
+          shortDesc: input.shortDesc,
+          longDesc: input.longDesc ?? "",
+          ...(input.qrSlug !== undefined ? { qrSlug: input.qrSlug } : {}),
+        };
+        const created = await tx.equipment.create({ data });
+        await writeAudit(
+          tx,
+          AuditAction.EQUIPMENT_CREATED,
+          undefined,
+          created.id,
+          { input }
+        );
+        return created;
+      });
+    },
+
+    async update(id, patch) {
+      return prisma.$transaction(async (tx) => {
+        const before = await tx.equipment.findUnique({ where: { id } });
+        if (!before)
+          throw new ServiceError("NOT_FOUND", "Equipment not found", 404);
+
+        const data: Prisma.EquipmentUpdateInput = {};
+        if (patch.shortDesc !== undefined) data.shortDesc = patch.shortDesc;
+        if (patch.longDesc !== undefined) data.longDesc = patch.longDesc;
+        if (patch.qrSlug !== undefined) data.qrSlug = patch.qrSlug;
+
+        const updated = await tx.equipment.update({ where: { id }, data });
+        await writeAudit(tx, AuditAction.EQUIPMENT_UPDATED, undefined, id, {
+          before,
+          patch,
+        });
+        return updated;
+      });
+    },
+
+    async retire(id: string) {
+      return prisma.$transaction(async (tx) => {
+        await lockEquipment(tx, id);
+        const eq = await tx.equipment.findUnique({ where: { id } });
+        if (!eq)
+          throw new ServiceError("NOT_FOUND", "Equipment not found", 404);
+        if (eq.status === EquipmentStatus.RETIRED) return eq;
+
+        if (
+          eq.status === EquipmentStatus.CHECKED_OUT ||
+          eq.status === EquipmentStatus.RESERVED
+        ) {
+          throw new ServiceError(
+            "CANNOT_RETIRE_WHILE_IN_USE",
+            "Cannot retire equipment while reserved/checked out",
+            409
+          );
+        }
+        if (await hasActiveCheckout(tx, id)) {
+          throw new ServiceError(
+            "ACTIVE_CHECKOUT_EXISTS",
+            "Equipment has an active reservation/checkout",
+            409
+          );
+        }
+
+        const updated = await tx.equipment.update({
+          where: { id },
+          data: { status: EquipmentStatus.RETIRED, retiredAt: now() },
+        });
+        await writeAudit(tx, AuditAction.EQUIPMENT_RETIRED, undefined, id, {});
+        return updated;
+      });
+    },
+
+    async unretire(id: string) {
+      return prisma.$transaction(async (tx) => {
+        await lockEquipment(tx, id);
+        const eq = await tx.equipment.findUnique({ where: { id } });
+        if (!eq)
+          throw new ServiceError("NOT_FOUND", "Equipment not found", 404);
+
+        if (eq.status !== EquipmentStatus.RETIRED) {
+          return recomputeStatus(tx, id);
+        }
+
+        await tx.equipment.update({
+          where: { id },
+          data: { status: EquipmentStatus.AVAILABLE, retiredAt: null },
+        });
+
+        await writeAudit(tx, AuditAction.EQUIPMENT_UPDATED, undefined, id, {
+          unretired: true,
+        });
+        return recomputeStatus(tx, id);
+      });
+    },
+
+    async hardDelete(id: string) {
+      return prisma.$transaction(async (tx) => {
+        await lockEquipment(tx, id);
+        const eq = await tx.equipment.findUnique({ where: { id } });
+        if (!eq)
+          throw new ServiceError("NOT_FOUND", "Equipment not found", 404);
+        if (eq.status !== EquipmentStatus.RETIRED)
+          throw new ServiceError(
+            "NOT_RETIRED",
+            "Only retired equipment can be deleted",
+            409
+          );
+
+        if (await hasActiveCheckout(tx, id))
+          throw new ServiceError(
+            "ACTIVE_CHECKOUT_EXISTS",
+            "Equipment has an active reservation/checkout",
+            409
+          );
+
+        await tx.checkout.deleteMany({ where: { equipmentId: id } });
+        await writeAudit(tx, AuditAction.EQUIPMENT_DELETED, undefined, id, {});
+        await tx.equipment.delete({ where: { id } });
+        return { deleted: true };
+      });
+    },
+
+    async assign(id: string, userId: string) {
+      return prisma.$transaction(async (tx) => {
+        await lockEquipment(tx, id);
+
+        const eq = await tx.equipment.findUnique({ where: { id } });
+        if (!eq)
+          throw new ServiceError("NOT_FOUND", "Equipment not found", 404);
+        if (eq.status === EquipmentStatus.RETIRED)
+          throw new ServiceError("RETIRED", "Equipment retired", 409);
+        if (eq.status === EquipmentStatus.MAINTENANCE)
+          throw new ServiceError(
+            "IN_MAINTENANCE",
+            "Equipment in maintenance",
+            409
+          );
+
+        const user = await tx.user.findUnique({ where: { id: userId } });
+        if (!user)
+          throw new ServiceError("USER_NOT_FOUND", "User not found", 404);
+
+        if (await hasActiveCheckout(tx, id))
+          throw new ServiceError(
+            "ALREADY_IN_USE",
+            "Equipment already reserved/checked out",
+            409
+          );
+
+        await tx.checkout.create({
+          data: {
+            equipmentId: id,
+            userId,
+            checkedOutAt: now(),
+          },
+        });
+        await tx.equipment.update({
+          where: { id },
+          data: { status: EquipmentStatus.CHECKED_OUT },
+        });
+
+        await writeAudit(tx, AuditAction.EQUIPMENT_CHECKED_OUT, userId, id, {
+          via: "assign",
+        });
+        return { id, userId };
+      });
+    },
+
+    async release(id: string) {
+      return prisma.$transaction(async (tx) => {
+        await lockEquipment(tx, id);
+        const active = await getActiveCheckout(tx, id);
+        if (active) {
+          await tx.checkout.update({
+            where: { id: active.id },
+            data: { releasedAt: now() },
+          });
+          await tx.equipment.update({
+            where: { id },
+            data: { status: EquipmentStatus.AVAILABLE },
+          });
+          await writeAudit(
+            tx,
+            AuditAction.FORCE_RELEASED,
+            active.userId,
+            id,
+            {}
+          );
+        }
+        return { released: true };
+      });
+    },
+  },
+
+  maintenance: {
+    async start(equipmentId: string) {
+      return prisma.$transaction(async (tx) => {
+        await lockEquipment(tx, equipmentId);
+        const eq = await tx.equipment.findUnique({
+          where: { id: equipmentId },
+        });
+        if (!eq)
+          throw new ServiceError("NOT_FOUND", "Equipment not found", 404);
+        if (eq.status === EquipmentStatus.RETIRED)
+          throw new ServiceError("RETIRED", "Equipment retired", 409);
+
+        if (await hasActiveCheckout(tx, equipmentId))
+          throw new ServiceError(
+            "ACTIVE_CHECKOUT_EXISTS",
+            "Equipment has an active reservation/checkout",
+            409
+          );
+
+        const updated = await tx.equipment.update({
+          where: { id: equipmentId },
+          data: { status: EquipmentStatus.MAINTENANCE },
+        });
+        await writeAudit(
+          tx,
+          AuditAction.MAINTENANCE_START,
+          undefined,
+          equipmentId,
+          {}
+        );
+        return updated;
+      });
+    },
+
+    async end(equipmentId: string) {
+      return prisma.$transaction(async (tx) => {
+        await lockEquipment(tx, equipmentId);
+        await tx.equipment.update({
+          where: { id: equipmentId },
+          data: { status: EquipmentStatus.AVAILABLE },
+        });
+        await writeAudit(
+          tx,
+          AuditAction.MAINTENANCE_END,
+          undefined,
+          equipmentId,
+          {}
+        );
+        return recomputeStatus(tx, equipmentId);
+      });
+    },
   },
 
   users: {
+    async list(params) {
+      const where: any = {};
+      if (params?.approved !== undefined) where.isApproved = params.approved;
+      if (params?.role) where.roles = { some: { role: params.role as any } };
+      return prisma.user.findMany({ where, include: { roles: true } });
+    },
+
+    async listHoldings() {
+      const rows = await prisma.checkout.findMany({
+        where: { releasedAt: null },
+        include: {
+          equipment: { select: { id: true, shortDesc: true } },
+        },
+        orderBy: { reservedAt: "desc" },
+      });
+
+      return rows.map((r) => ({
+        userId: r.userId,
+        equipmentId: r.equipmentId,
+        shortDesc: r.equipment?.shortDesc ?? "",
+        state: r.checkedOutAt
+          ? EquipmentStatus.CHECKED_OUT
+          : EquipmentStatus.RESERVED,
+        reservedAt: r.reservedAt,
+        checkedOutAt: r.checkedOutAt ?? null,
+      }));
+    },
+
+    async approve(userId: string) {
+      const updated = await prisma.user.update({
+        where: { id: userId },
+        data: { isApproved: true },
+      });
+      await writeAudit(
+        prisma,
+        AuditAction.USER_APPROVED,
+        userId,
+        undefined,
+        {}
+      );
+      return updated;
+    },
+
+    async addRole(userId: string, role: "ADMIN" | "WORKER") {
+      const roleRow = await prisma.userRole.create({
+        data: { userId, role: role as any },
+      });
+      await writeAudit(prisma, AuditAction.ROLE_ASSIGNED, userId, undefined, {
+        role,
+      });
+      return roleRow;
+    },
+
+    async removeRole(userId: string, role: "ADMIN" | "WORKER") {
+      if (role === "WORKER") {
+        const active = await prisma.checkout.count({
+          where: { userId, releasedAt: null },
+        });
+        if (active > 0) {
+          throw new ServiceError(
+            "USER_HAS_ACTIVE_EQUIPMENT",
+            "Cannot remove Worker role while the user has reserved/checked-out equipment.",
+            409
+          );
+        }
+      }
+
+      const toDelete = await prisma.userRole.findFirst({
+        where: { userId, role: role as any },
+      });
+      if (!toDelete) return { deleted: false };
+
+      await prisma.userRole.delete({ where: { id: toDelete.id } });
+      return { deleted: true };
+    },
+
+    async remove(userId: string, actorUserId: string) {
+      if (!actorUserId) {
+        throw new ServiceError("UNAUTHORIZED", "Missing actor", 401);
+      }
+      if (actorUserId === userId) {
+        throw new ServiceError(
+          "CANNOT_DELETE_SELF",
+          "You cannot delete your own account",
+          400
+        );
+      }
+
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        include: { roles: true },
+      });
+      if (!user) {
+        throw new ServiceError("NOT_FOUND", "User not found", 404);
+      }
+
+      const isAdmin = user.roles.some((r) => r.role === "ADMIN");
+      if (isAdmin) {
+        const otherAdmins = await prisma.userRole.count({
+          where: { role: "ADMIN", userId: { not: userId } },
+        });
+        if (otherAdmins === 0) {
+          throw new ServiceError(
+            "LAST_ADMIN",
+            "Cannot delete the last remaining admin",
+            409
+          );
+        }
+      }
+
+      let clerkDeleted = false;
+      if (user.clerkUserId) {
+        try {
+          await clerk.users.deleteUser(user.clerkUserId);
+          clerkDeleted = true;
+        } catch (e: any) {
+          clerkDeleted =
+            typeof e?.status === "number" ? e.status === 404 : false;
+        }
+      }
+
+      await prisma.user.delete({ where: { id: userId } });
+
+      return { deleted: true as const, clerkDeleted };
+    },
+
     // Implements a GET /me endpoint that authenticates with Clerk (via header or cookie),
     // ensures there’s a matching user in your Prisma DB, optionally bootstraps ADMIN/WORKER roles based on an env list,
     // then returns a normalized “me” object.
@@ -210,6 +765,33 @@ export const services: Services = {
         email: user!.email ?? undefined,
         displayName: user!.displayName ?? undefined,
       };
+    },
+  },
+
+  audit: {
+    async list(params) {
+      const where: any = {};
+      if (params.actorUserId) where.actorUserId = params.actorUserId;
+      if (params.equipmentId) where.equipmentId = params.equipmentId;
+      if (params.action) where.action = params.action;
+      if (params.from || params.to) {
+        where.createdAt = {
+          gte: params.from ? new Date(params.from) : undefined,
+          lte: params.to ? new Date(params.to) : undefined,
+        };
+      }
+      const page = params.page ?? 1;
+      const pageSize = params.pageSize ?? 50;
+      const [items, total] = await Promise.all([
+        prisma.auditEvent.findMany({
+          where,
+          orderBy: { createdAt: "desc" },
+          skip: (page - 1) * pageSize,
+          take: pageSize,
+        }),
+        prisma.auditEvent.count({ where }),
+      ]);
+      return { items, total };
     },
   },
 };
