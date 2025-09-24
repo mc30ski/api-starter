@@ -409,6 +409,215 @@ export const services: Services = {
         return { released: true };
       });
     },
+
+    async reserve(id: string, userId: string) {
+      return prisma.$transaction(async (tx) => {
+        await lockEquipment(tx, id);
+        const eq = await tx.equipment.findUnique({ where: { id } });
+        if (!eq)
+          throw new ServiceError("NOT_FOUND", "Equipment not found", 404);
+        if (eq.retiredAt)
+          throw new ServiceError("RETIRED", "Equipment retired", 409);
+        if (eq.status !== EquipmentStatus.AVAILABLE)
+          throw new ServiceError(
+            "NOT_AVAILABLE",
+            "Equipment not available",
+            409
+          );
+
+        if (await hasActiveCheckout(tx, id))
+          throw new ServiceError(
+            "ALREADY_IN_USE",
+            "Equipment already reserved/checked out",
+            409
+          );
+
+        await tx.checkout.create({
+          data: { equipmentId: id, userId },
+        });
+        await tx.equipment.update({
+          where: { id },
+          data: { status: EquipmentStatus.RESERVED },
+        });
+
+        await writeAudit(tx, AuditAction.EQUIPMENT_RESERVED, userId, id, {});
+        return { id, userId };
+      });
+    },
+
+    async cancelReservation(id: string, userId: string) {
+      return prisma.$transaction(async (tx) => {
+        await lockEquipment(tx, id);
+        const active = await getActiveCheckout(tx, id);
+        if (!active || active.checkedOutAt)
+          throw new ServiceError(
+            "NO_ACTIVE_RESERVATION",
+            "No active reservation to cancel",
+            409
+          );
+        if (active.userId !== userId)
+          throw new ServiceError("NOT_OWNER", "Not your reservation", 403);
+
+        await tx.checkout.update({
+          where: { id: active.id },
+          data: { releasedAt: now() },
+        });
+        await tx.equipment.update({
+          where: { id },
+          data: { status: EquipmentStatus.AVAILABLE },
+        });
+
+        await writeAudit(tx, AuditAction.RESERVATION_CANCELLED, userId, id, {});
+        return { cancelled: true };
+      });
+    },
+
+    async checkout(id: string, userId: string) {
+      return prisma.$transaction(async (tx) => {
+        await lockEquipment(tx, id);
+        const eq = await tx.equipment.findUnique({ where: { id } });
+        if (!eq)
+          throw new ServiceError("NOT_FOUND", "Equipment not found", 404);
+        if (eq.status !== EquipmentStatus.RESERVED)
+          throw new ServiceError(
+            "NOT_RESERVED",
+            "Must reserve before checkout",
+            409
+          );
+
+        const active = await getActiveCheckout(tx, id);
+        if (!active || active.userId !== userId || active.checkedOutAt)
+          throw new ServiceError(
+            "NOT_ALLOWED",
+            "Reservation not owned or already checked out",
+            403
+          );
+
+        await tx.checkout.update({
+          where: { id: active.id },
+          data: { checkedOutAt: now() },
+        });
+        await tx.equipment.update({
+          where: { id },
+          data: { status: EquipmentStatus.CHECKED_OUT },
+        });
+
+        await writeAudit(tx, AuditAction.EQUIPMENT_CHECKED_OUT, userId, id, {});
+        return { id, userId };
+      });
+    },
+
+    async returnByUser(id: string, userId: string) {
+      return prisma.$transaction(async (tx) => {
+        await lockEquipment(tx, id);
+        const active = await getActiveCheckout(tx, id);
+        if (!active || !active.checkedOutAt)
+          throw new ServiceError(
+            "NO_ACTIVE_CHECKOUT",
+            "No active checkout to return",
+            409
+          );
+        if (active.userId !== userId)
+          throw new ServiceError(
+            "NOT_OWNER",
+            "You did not check this out",
+            403
+          );
+
+        await tx.checkout.update({
+          where: { id: active.id },
+          data: { releasedAt: now() },
+        });
+        await tx.equipment.update({
+          where: { id },
+          data: { status: EquipmentStatus.AVAILABLE },
+        });
+
+        await writeAudit(tx, AuditAction.EQUIPMENT_RETURNED, userId, id, {});
+        return { released: true };
+      });
+    },
+
+    async releaseByUser(id: string, userId: string) {
+      return prisma.$transaction(async (tx) => {
+        await lockEquipment(tx, id);
+        const active = await getActiveCheckout(tx, id);
+        if (!active) return { released: true };
+
+        if (active.userId !== userId)
+          throw new ServiceError("NOT_OWNER", "Not yours", 403);
+
+        if (active.checkedOutAt) {
+          await tx.checkout.update({
+            where: { id: active.id },
+            data: { releasedAt: now() },
+          });
+          await tx.equipment.update({
+            where: { id },
+            data: { status: EquipmentStatus.AVAILABLE },
+          });
+          await writeAudit(tx, AuditAction.EQUIPMENT_RETURNED, userId, id, {
+            via: "legacy_release",
+          });
+        } else {
+          await tx.checkout.update({
+            where: { id: active.id },
+            data: { releasedAt: now() },
+          });
+          await tx.equipment.update({
+            where: { id },
+            data: { status: EquipmentStatus.AVAILABLE },
+          });
+          await writeAudit(tx, AuditAction.RESERVATION_CANCELLED, userId, id, {
+            via: "legacy_release",
+          });
+        }
+        return { released: true };
+      });
+    },
+
+    async listUnavailableWithHolder() {
+      const rows = await prisma.equipment.findMany({
+        where: {
+          status: {
+            in: [
+              EquipmentStatus.MAINTENANCE,
+              EquipmentStatus.RESERVED,
+              EquipmentStatus.CHECKED_OUT,
+            ],
+          },
+        },
+        orderBy: { createdAt: "desc" },
+        include: {
+          checkouts: {
+            where: { releasedAt: null },
+            include: { user: true },
+            take: 1,
+          },
+        },
+      });
+
+      const mapped: EquipmentWithHolder[] = rows.map((e) => {
+        const active = e.checkouts[0];
+        const holder = active
+          ? {
+              userId: active.userId,
+              displayName: active.user?.displayName ?? null,
+              email: active.user?.email ?? null,
+              reservedAt: active.reservedAt,
+              checkedOutAt: active.checkedOutAt ?? null,
+              state: active.checkedOutAt ? "CHECKED_OUT" : "RESERVED",
+            }
+          : null;
+
+        // strip relation arrays to satisfy Equipment shape
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const { checkouts, auditEvents, ...equip } = e as any;
+        return { ...(equip as any), holder };
+      });
+
+      return mapped;
+    },
   },
 
   maintenance: {

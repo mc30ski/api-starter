@@ -2,7 +2,10 @@ import type { Equipment, AuditEvent, User, UserRole } from "@prisma/client";
 
 export type Role = "ADMIN" | "WORKER";
 
+type ReserveResult = { id: string; userId: string };
+type CheckoutResult = { id: string; userId: string };
 type ReleaseResult = { released: true };
+type CancelResult = { cancelled: true };
 
 //TODO: WHY DO I NEED BOTH OF THESE?
 export type AdminHolder = {
@@ -37,6 +40,7 @@ export type Services = {
     listUnavailableForWorkers(): Promise<Equipment[]>;
     // Items I currently hold (reserved or checked out)
     listMine(userId: string): Promise<Equipment[]>;
+    listUnavailableWithHolder(): Promise<EquipmentWithHolder[]>;
 
     // -------- CRUD --------
     create(input: {
@@ -58,6 +62,14 @@ export type Services = {
     assign(id: string, userId: string): Promise<{ id: string; userId: string }>;
     // Force release (from RESERVED or CHECKED_OUT)
     release(id: string): Promise<ReleaseResult>;
+
+    // Worker lifecycle (RESERVE → CHECKOUT → RETURN)
+    reserve(id: string, userId: string): Promise<ReserveResult>;
+    cancelReservation(id: string, userId: string): Promise<CancelResult>;
+    checkout(id: string, userId: string): Promise<CheckoutResult>;
+    returnByUser(id: string, userId: string): Promise<ReleaseResult>;
+
+    releaseByUser(id: string, userId: string): Promise<ReleaseResult>;
   };
 
   maintenance: {

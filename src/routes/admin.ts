@@ -4,9 +4,8 @@ import { Role as RoleVal } from "@prisma/client";
 
 export default async function adminRoutes(app: FastifyInstance) {
   const adminGuard = {
-    //TODO:
-    //preHandler: (req: FastifyRequest, reply: FastifyReply) =>
-    //  app.requireRole(req, reply, RoleVal.ADMIN),
+    preHandler: (req: FastifyRequest, reply: FastifyReply) =>
+      app.requireRole(req, reply, RoleVal.ADMIN),
   };
 
   //TODO: WHY DO WE NEED BOTH OF THESE?
