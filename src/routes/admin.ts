@@ -2,5 +2,14 @@ import { FastifyInstance } from "fastify";
 import { services } from "../services";
 
 export default async function adminRoutes(app: FastifyInstance) {
-  app.get("/admin/equipment", async () => services.equipment.listAvailable());
+  //TODO:
+  const adminGuard = {
+    //  preHandler: [
+    //    (app as any).requireRole.bind(app, undefined, undefined, "ADMIN"),
+    //  ],
+  };
+
+  app.get("/admin/equipment", adminGuard, async () =>
+    services.equipment.listAvailable()
+  );
 }
