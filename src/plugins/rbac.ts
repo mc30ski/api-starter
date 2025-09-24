@@ -22,7 +22,7 @@ export default fp(async (app: FastifyInstance) => {
     }
 
     // This should upsert on first visit (keep the upsert in services.users.me)
-    const me = await services.users.me(clerkUserId);
+    const me = await services.currentUser.me(clerkUserId);
 
     // Attach for downstream usage
     (req as any).user = me;
@@ -54,11 +54,7 @@ export default fp(async (app: FastifyInstance) => {
 declare module "fastify" {
   interface FastifyInstance {
     requireApproved(req: FastifyRequest, reply: any): Promise<void>;
-    requireRole(
-      req: FastifyRequest,
-      reply: any,
-      role: "ADMIN" | "WORKER"
-    ): Promise<void>;
+    requireRole(req: FastifyRequest, reply: any, role: Role): Promise<void>;
   }
 
   interface FastifyRequest {

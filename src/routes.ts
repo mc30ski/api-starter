@@ -3,8 +3,11 @@ import cors, { type FastifyCorsOptions } from "@fastify/cors";
 import sensible from "@fastify/sensible";
 import { getVersionInfo } from "./lib/version";
 import auth from "./plugins/auth";
+import rbac from "./plugins/rbac";
 import errorMapper from "./plugins/errorMapper";
 import adminRoutes from "./routes/admin";
+import meRoutes from "./routes/me";
+import usersRoutes from "./routes/users";
 
 // ---------- CORS Helpers
 
@@ -140,7 +143,10 @@ export async function registerRoutes(app: FastifyInstance) {
   // ---------- Register all API endpoints
   await app.register(
     async (api) => {
+      await api.register(rbac);
+      await api.register(meRoutes);
       await api.register(adminRoutes);
+      await app.register(usersRoutes);
     },
     { prefix: "/api" }
   );
